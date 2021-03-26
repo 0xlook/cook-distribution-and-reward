@@ -5,6 +5,7 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
+import "@openzeppelin/contracts/cryptography/MerkleProof.sol";
 import "@uniswap/v2-core/contracts/interfaces/IUniswapV2Pair.sol";
 import "../oracle/IOracle.sol";
 import "../oracle/IWETH.sol";
@@ -22,24 +23,17 @@ contract CookDistribution is Ownable, AccessControl {
     using SafeMath for uint256;
     using SafeERC20 for IERC20;
 
-    event AllocationRegistered(address indexed beneficiary, uint256 amount);
     event TokensWithdrawal(address userAddress, uint256 amount);
 
     struct Allocation {
-        uint256 amount;
         uint256 released;
         bool blackListed;
-        bool isRegistered;
     }
 
-    // beneficiary of tokens after they are released
     mapping(address => Allocation) private _beneficiaryAllocations;
 
     // oracle price data (dayNumber => price)
     mapping(uint256 => uint256) private _oraclePriceFeed;
-
-    // all beneficiary address1
-    address[] private _allBeneficiary;
 
     // vesting start time unix
     uint256 private _start;
@@ -61,6 +55,9 @@ contract CookDistribution is Ownable, AccessControl {
 
     // Max step can be moved
     uint32 private _maxPriceUnlockMoveStep;
+
+    // root node of merkle tree
+    bytes32 private  _merkleRoot;
 
     IERC20 private _token;
 
@@ -84,8 +81,7 @@ contract CookDistribution is Ownable, AccessControl {
 
     constructor(
         IERC20 token_,
-        address[] memory beneficiaries_,
-        uint256[] memory amounts_,
+        bytes32 merkleRoot_,
         uint256 start, // in unix
         uint256 duration, // in day
         uint32 interval, // in day
@@ -98,41 +94,14 @@ contract CookDistribution is Ownable, AccessControl {
             priceConsumer_ != address(0),
             "PriceConsumer address can not be zero."
         );
-
-        require(
-            beneficiaries_.length == amounts_.length,
-            "Length of input arrays do not match."
-        );
         require(duration > 0, "duraction should be greater than zeo");
         require(
             start.add((duration).mul(SECONDS_PER_DAY)) > block.timestamp,
             "start unix time should be greater than current block timestamp"
         );
 
-        // init beneficiaries
-        for (uint256 i = 0; i < beneficiaries_.length; i++) {
-            require(
-                beneficiaries_[i] != address(0),
-                "Beneficiary cannot be 0 address."
-            );
-
-            require(amounts_[i] > 0, "Cannot allocate zero amount.");
-
-            // store all beneficiaries address
-            _allBeneficiary.push(beneficiaries_[i]);
-
-            // Add new allocation to beneficiaryAllocations
-            _beneficiaryAllocations[beneficiaries_[i]] = Allocation(
-                amounts_[i],
-                0,
-                false,
-                true
-            );
-
-            emit AllocationRegistered(beneficiaries_[i], amounts_[i]);
-        }
-
         _token = token_;
+        _merkleRoot = merkleRoot_;
         _duration = duration;
         _start = start;
         _interval = interval;
@@ -164,6 +133,12 @@ contract CookDistribution is Ownable, AccessControl {
         revert();
     }
 
+    modifier onlyValidMerkleProof(uint256 index, address account, uint256 amount, bytes32[] memory merkleProof) {
+        bytes32 node = keccak256(abi.encodePacked(index, account, amount));
+        require(MerkleProof.verify(merkleProof, _merkleRoot, node), 'MerkleDistributor: Invalid proof.');
+        _;
+    }
+
     /**
      * @return the start time of the token vesting. in unix
      */
@@ -178,31 +153,25 @@ contract CookDistribution is Ownable, AccessControl {
         return _duration;
     }
 
-    /**
-     * @return the registerd state.
-     */
-    function getRegisteredStatus(address userAddress) public view returns (bool) {
-        return _beneficiaryAllocations[userAddress].isRegistered;
+    function merkleRoot() public view returns (bytes32) {
+        return _merkleRoot;
     }
 
-    function getUserVestingAmount(address userAddress) public view returns (uint256) {
-        return _beneficiaryAllocations[userAddress].amount;
-    }
-
-    function getUserAvailableAmount(address userAddress, uint256 onDayOrToday) public view returns (uint256) {
+    // we assume that the userAmount is valid amount here
+    function getUserAvailableAmount(address userAddress, uint256 userAmount, uint256 onDayOrToday) public view returns (uint256) {
         uint256 avalible =
-            _getVestedAmount(userAddress, onDayOrToday).sub(
+            _getVestedAmount(userAmount, onDayOrToday).sub(
                 _beneficiaryAllocations[userAddress].released
             );
         return avalible;
     }
 
-    function getUserVestedAmount(address userAddress, uint256 onDayOrToday)
+    function getVestedAmount(uint256 userAmount, uint256 onDayOrToday)
         public
         view
         returns (uint256 amountVested)
     {
-        return _getVestedAmount(userAddress, onDayOrToday);
+        return _getVestedAmount(userAmount, onDayOrToday);
     }
 
     /**
@@ -220,12 +189,12 @@ contract CookDistribution is Ownable, AccessControl {
         return onDayOrToday == 0 ? today() : onDayOrToday;
     }
 
-    function _getVestedAmount(address userAddress, uint256 onDayOrToday) internal view returns (uint256) {
+    function _getVestedAmount(uint256 amount, uint256 onDayOrToday) internal view returns (uint256) {
         uint256 onDay = _effectiveDay(onDayOrToday); // day
 
         // If after end of vesting, then the vested amount is total amount.
         if (onDay >= (startDay() + _duration)) {
-            return _beneficiaryAllocations[userAddress].amount;
+            return amount;
         }
         // If it's before the vesting then the vested amount is zero.
         else if (onDay < startDay()) {
@@ -248,24 +217,20 @@ contract CookDistribution is Ownable, AccessControl {
             uint256 vested = 0;
 
             if (
-                _beneficiaryAllocations[userAddress]
-                    .amount
+                amount
                     .mul(effectiveDaysVested)
                     .div(_duration) >
-                _beneficiaryAllocations[userAddress]
-                    .amount
+                amount
                     .mul(_advancePercentage)
                     .div(100)
             ) {
                 // no price based percentage > date based percentage
-                vested = _beneficiaryAllocations[userAddress]
-                    .amount
+                vested = amount
                     .mul(effectiveDaysVested)
                     .div(_duration);
             } else {
                 // price based percentage > date based percentage
-                vested = _beneficiaryAllocations[userAddress]
-                    .amount
+                vested = amount
                     .mul(_advancePercentage)
                     .div(100);
             }
@@ -277,13 +242,10 @@ contract CookDistribution is Ownable, AccessControl {
     /**
     withdraw function
    */
-    function withdraw(uint256 withdrawAmount) public {
+    function withdraw(uint256 index, uint256 userAmount, bytes32[] calldata merkleProof, uint256 withdrawAmount) 
+    onlyValidMerkleProof(index, msg.sender, userAmount, merkleProof)
+    external {
         address userAddress = msg.sender;
-
-        require(
-            _beneficiaryAllocations[userAddress].isRegistered == true,
-            "You have to be a registered address in order to release tokens."
-        );
 
         require(
             _beneficiaryAllocations[userAddress].blackListed == false,
@@ -296,7 +258,7 @@ contract CookDistribution is Ownable, AccessControl {
         );
 
         require(
-            getUserAvailableAmount(userAddress, today()) >= withdrawAmount,
+            getUserAvailableAmount(userAddress, userAmount, today()) >= withdrawAmount,
             "insufficient avalible cook balance"
         );
 
@@ -339,17 +301,21 @@ contract CookDistribution is Ownable, AccessControl {
     }
 
     // Zap into LP staking pool functions
-    function zapLPWithEth(uint256 cookAmount, address poolAddress) external payable {
-        _zapLP(cookAmount, poolAddress, true);
+    function zapLPWithEth(uint256 index, uint256 userAmount, bytes32[] calldata merkleProof, uint256 cookAmount, address poolAddress)
+    onlyValidMerkleProof(index, msg.sender, userAmount, merkleProof)
+    external payable {
+        _zapLP(userAmount, cookAmount, poolAddress, true);
     }
 
-    function zapLP(uint256 cookAmount, address poolAddress) external {
-        _zapLP(cookAmount, poolAddress, false);
+    function zapLP(uint256 index, uint256 userAmount, bytes32[] calldata merkleProof, uint256 cookAmount, address poolAddress) 
+    onlyValidMerkleProof(index, msg.sender, userAmount, merkleProof)
+    external {
+        _zapLP(userAmount, cookAmount, poolAddress, false);
     }
 
-    function _zapLP(uint256 cookAmount, address poolAddress, bool isWithEth) internal {
+    function _zapLP(uint256 userAmount, uint256 cookAmount, address poolAddress, bool isWithEth) internal {
         address userAddress = msg.sender;
-        _checkValidZap(userAddress, cookAmount);
+        _checkValidZap(userAddress, userAmount, cookAmount);
 
         uint256 newUniv2 = 0;
 
@@ -364,9 +330,17 @@ contract CookDistribution is Ownable, AccessControl {
         IPool(poolAddress).zapStake(newUniv2, userAddress);
     }
 
-    function _checkValidZap(address userAddress, uint256 cookAmount) internal {
-        require(_beneficiaryAllocations[userAddress].isRegistered == true, "You have to be a registered address in order to release tokens.");
+      // Zap into Cook staking pool functions
+    function zapCook(uint256 index, uint256 userAmount, bytes32[] calldata merkleProof, uint256 cookAmount, address cookPoolAddress) 
+    onlyValidMerkleProof(index, msg.sender, userAmount, merkleProof)
+    external {
+        address userAddress = msg.sender;
+        _checkValidZap(userAddress, userAmount, cookAmount);
+        IERC20(address(_token)).approve(cookPoolAddress, cookAmount);
+        IPool(cookPoolAddress).zapStake(cookAmount, userAddress);
+    }
 
+    function _checkValidZap(address userAddress, uint256 userAmount, uint256 cookAmount) internal {
         require(
             _beneficiaryAllocations[userAddress].blackListed == false,
             "Your address is blacklisted"
@@ -377,7 +351,7 @@ contract CookDistribution is Ownable, AccessControl {
         require(cookAmount > 0, "zero zap amount");
 
         require(
-            getUserAvailableAmount(userAddress, today()) >= cookAmount, "insufficient avalible cook balance"
+            getUserAvailableAmount(userAddress, userAmount, today()) >= cookAmount, "insufficient avalible cook balance"
         );
 
         _beneficiaryAllocations[userAddress].released = _beneficiaryAllocations[userAddress].released.add(cookAmount);
@@ -436,14 +410,6 @@ contract CookDistribution is Ownable, AccessControl {
         return (wethAmount, lpPair.mint(address(this)));
     }
 
-    // Zap into Cook staking pool functions
-    function zapCook(uint256 cookAmount, address cookPoolAddress) external {
-        address userAddress = msg.sender;
-        _checkValidZap(userAddress, cookAmount);
-        IERC20(address(_token)).approve(cookPoolAddress, cookAmount);
-        IPool(cookPoolAddress).zapStake(cookAmount, userAddress);
-    }
-
     // Admin Functions
     function setPriceBasedMaxStep(uint32 newMaxPriceBasedStep) public {
         require(hasRole(MANAGER_ROLE, msg.sender), "Caller is not a manager");
@@ -458,48 +424,6 @@ contract CookDistribution is Ownable, AccessControl {
     function getNextPriceUnlockStep() public view returns (uint32) {
         require(hasRole(MANAGER_ROLE, msg.sender), "Caller is not a manager");
         return _nextPriceUnlockStep;
-    }
-
-    /**
-     * add adddress with allocation
-     */
-    function addAddressWithAllocation(address beneficiaryAddress, uint256 amount ) public  {
-        require(hasRole(MANAGER_ROLE, msg.sender), "Caller is not a manager");
-
-        require(
-            _beneficiaryAllocations[beneficiaryAddress].isRegistered == false,
-            "The address to be added already exisits in the distribution contact, please use a new one"
-        );
-
-        _beneficiaryAllocations[beneficiaryAddress].isRegistered = true;
-        _beneficiaryAllocations[beneficiaryAddress] = Allocation( amount, 0, false, true
-        );
-
-        emit AllocationRegistered(beneficiaryAddress, amount);
-    }
-
-    /**
-     * Add multiple address with multiple allocations
-     */
-    function addMultipleAddressWithAllocations(address[] memory beneficiaryAddresses, uint256[] memory amounts) public {
-        require(hasRole(MANAGER_ROLE, msg.sender), "Caller is not a manager");
-
-        require(beneficiaryAddresses.length > 0 && amounts.length > 0 && beneficiaryAddresses.length == amounts.length,
-            "The length of user addressed and amounts should be matched and cannot be empty"
-        );
-
-        for (uint256 i = 0; i < beneficiaryAddresses.length; i++) {
-            require(_beneficiaryAllocations[beneficiaryAddresses[i]].isRegistered == false,
-                "The address to be added already exisits in the distribution contact, please use a new one"
-            );
-        }
-
-        for (uint256 i = 0; i < beneficiaryAddresses.length; i++) {
-            _beneficiaryAllocations[beneficiaryAddresses[i]].isRegistered = true;
-            _beneficiaryAllocations[beneficiaryAddresses[i]] = Allocation(amounts[i], 0, false, true);
-
-            emit AllocationRegistered(beneficiaryAddresses[i], amounts[i]);
-        }
     }
 
     function updatePricePercentage(uint256[] memory priceKey_, uint256[] memory percentageValue_) public {
@@ -518,20 +442,9 @@ contract CookDistribution is Ownable, AccessControl {
         }
     }
 
-    /**
-     * return total vested cook amount
-     */
-    function getTotalAvailable() public view returns (uint256) {uint256 totalAvailable = 0;
+    function updateMerkleRoot(bytes32 newMerkleRoot) external {
         require(hasRole(MANAGER_ROLE, msg.sender), "Caller is not a manager");
-
-        for (uint256 i = 0; i < _allBeneficiary.length; ++i) {
-            totalAvailable += getUserAvailableAmount(
-                _allBeneficiary[i],
-                today()
-            );
-        }
-
-        return totalAvailable;
+        _merkleRoot = newMerkleRoot;
     }
 
     function getLatestSevenSMA() public returns (uint256) {
