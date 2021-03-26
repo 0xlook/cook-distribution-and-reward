@@ -8,8 +8,7 @@ contract MockCookDistribution is CookDistribution {
 
     constructor(
         IERC20 token_,
-        address[] memory beneficiaries_,
-        uint256[] memory amounts_,
+        bytes32 merkleRoot_,
         uint256 start, // in unix
         uint256 duration, // in day
         uint32 interval, // in day
@@ -19,8 +18,7 @@ contract MockCookDistribution is CookDistribution {
         public
         CookDistribution(
             token_,
-            beneficiaries_,
-            amounts_,
+            merkleRoot_,
             start,
             duration,
             interval,
